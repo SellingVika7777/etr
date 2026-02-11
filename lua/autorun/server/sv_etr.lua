@@ -1,0 +1,422 @@
+-- ETR (Eblan Trouble Register) server addon. SellingVika. https://sellingvika.party/etr
+if not SERVER then return end
+
+local ETR_API_BASE = "https://sellingvika.party/etr/v3"
+local ETR_REJECT_MSG = "Вы заблокированы системой ETR (Eblan Trouble Register).\nПодробнее: https://sellingvika.party/etr"
+local ETR_STRICT_MSG = "[ETR]. Подключитесь повторно через 15 секунд."
+local STEAMID64_LEN = 17
+local STEAMID64_MIN = "76561197960265728"
+
+local cv_apikey, cv_enabled, cv_api_base, cv_debug
+local cv_cache_ttl, cv_fail_open, cv_periodic_interval, cv_strict_first
+local etr_registered = false
+local etr_api_available = true
+local etr_cache = {}
+local etr_cache_time = {}
+local etr_check_pending = {}
+
+CreateConVar("etr_apikey", "", FCVAR_PROTECTED + FCVAR_NOTIFY, "", 0, 0)
+CreateConVar("etr_enabled", "1", FCVAR_ARCHIVE, "", 0, 1)
+CreateConVar("etr_api_base", ETR_API_BASE, FCVAR_ARCHIVE, "", 0, 0)
+CreateConVar("etr_debug", "0", FCVAR_ARCHIVE, "", 0, 1)
+CreateConVar("etr_cache_ttl", "300", FCVAR_ARCHIVE, "", 60, 86400)
+CreateConVar("etr_fail_open", "1", FCVAR_ARCHIVE, "", 0, 1)
+CreateConVar("etr_periodic_interval", "600", FCVAR_ARCHIVE, "", 0, 3600)
+CreateConVar("etr_strict_first", "0", FCVAR_ARCHIVE, "", 0, 1)
+
+local function cv()
+    cv_apikey = GetConVar("etr_apikey")
+    cv_enabled = GetConVar("etr_enabled")
+    cv_api_base = GetConVar("etr_api_base")
+    cv_debug = GetConVar("etr_debug")
+    cv_cache_ttl = GetConVar("etr_cache_ttl")
+    cv_fail_open = GetConVar("etr_fail_open")
+    cv_periodic_interval = GetConVar("etr_periodic_interval")
+    cv_strict_first = GetConVar("etr_strict_first")
+end
+cv()
+
+local function log(msg)
+    if not cv_debug or cv_debug:GetInt() == 0 then return end
+    print("[ETR] " .. tostring(msg))
+end
+
+local function get_base()
+    local b = cv_api_base and cv_api_base:GetString() or ETR_API_BASE
+    return (b or ""):gsub("/+$", "")
+end
+
+local function get_key()
+    return (cv_apikey and cv_apikey:GetString() or "") or ""
+end
+
+local function valid_steamid64(sid)
+    if type(sid) ~= "string" then return false end
+    sid = string.Trim(sid)
+    if #sid < STEAMID64_LEN then return false end
+    if sid == "0" then return false end
+    local n = tonumber(sid:sub(1, 17))
+    if not n then return false end
+    return n >= tonumber(STEAMID64_MIN)
+end
+
+local function to_steamid64(steamid)
+    if type(steamid) == "number" then steamid = tostring(steamid) end
+    if type(steamid) ~= "string" then return nil end
+    steamid = string.Trim(steamid)
+    if steamid:find("^%d+$") and #steamid >= STEAMID64_LEN then
+        return valid_steamid64(steamid) and steamid:sub(1, STEAMID64_LEN) or nil
+    end
+    if util.SteamIDTo64 then
+        local ok, out = pcall(util.SteamIDTo64, steamid)
+        if ok and out and out ~= "0" then return out end
+    end
+    return nil
+end
+
+local function register_server()
+    local key = get_key()
+    if key == "" then return end
+    cv()
+    local hostname = GetHostName()
+    if hostname == "" then hostname = "GMod Server" end
+    local server_ip = game.GetIPAddress and game.GetIPAddress() or "0.0.0.0"
+    if server_ip == "loopback" then server_ip = "0.0.0.0" end
+    local base = get_base()
+    if base == "" then return end
+    local body = util.TableToJSON({ name = hostname, ip = server_ip, app_id = 4020 })
+    if not body or body == "" then return end
+    local headers = {
+        ["Content-Type"] = "application/json",
+        ["Content-Length"] = tostring(#body),
+        ["X-API-Key"] = key,
+    }
+    HTTP({
+        url = base .. "/server/register",
+        method = "POST",
+        body = body,
+        headers = headers,
+        success = function(code)
+            if code >= 200 and code < 300 then
+                etr_registered = true
+                etr_api_available = true
+                log("Registered: " .. hostname)
+            end
+        end,
+        failed = function(err)
+            log("Register failed: " .. tostring(err))
+        end,
+    })
+end
+
+-- GET /etr/v3/status/{steamId}: 200 OK {"status":true,"steam_id":"..."} => in ETR
+local function parse_check_response(body, code)
+    if code ~= 200 then return false end
+    if not body or body == "" then return false end
+    local ok, data = pcall(util.JSONToTable, body)
+    if ok and data and data.status == true then return true end
+    return false
+end
+
+local function check_player(steamID64, callback)
+    if not callback or not valid_steamid64(tostring(steamID64)) then
+        if callback then callback(false) end
+        return
+    end
+    steamID64 = tostring(steamID64):sub(1, STEAMID64_LEN)
+    local key = get_key()
+    if key == "" then callback(false) return end
+    local base = get_base()
+    if base == "" then callback(false) return end
+    local url = base .. "/status/" .. steamID64
+    local headers = { ["X-API-Key"] = key }
+    etr_check_pending[steamID64] = true
+    http.Fetch(url, function(body, size, respHeaders, code)
+        etr_check_pending[steamID64] = nil
+        etr_api_available = true
+        local banned = parse_check_response(body or "", code)
+        local ttl = (cv_cache_ttl and cv_cache_ttl:GetInt()) or 300
+        etr_cache[steamID64] = banned
+        etr_cache_time[steamID64] = CurTime()
+        callback(banned)
+    end, function(err)
+        etr_check_pending[steamID64] = nil
+        etr_api_available = false
+        log("Check failed: " .. tostring(err))
+        callback(false)
+    end, headers)
+end
+
+local function get_cached(steamID64)
+    steamID64 = tostring(steamID64)
+    if not valid_steamid64(steamID64) then return nil end
+    steamID64 = steamID64:sub(1, STEAMID64_LEN)
+    local cached = etr_cache[steamID64]
+    local at = etr_cache_time[steamID64]
+    local ttl = (cv_cache_ttl and cv_cache_ttl:GetInt()) or 300
+    if cached ~= nil and at and (CurTime() - at) < ttl then return cached end
+    return nil
+end
+
+local FEED_MAX = 200
+
+local function send_feed(steam_ids, reason, comment)
+    if type(steam_ids) ~= "table" or #steam_ids == 0 then return end
+    local key = get_key()
+    if key == "" then return end
+    local base = get_base()
+    if base == "" then return end
+    local body = util.TableToJSON({
+        steam_ids = steam_ids,
+        reason = type(reason) == "string" and reason:sub(1, 512) or "Server ban list",
+        comment = type(comment) == "string" and comment:sub(1, 500) or "",
+    })
+    if not body then return end
+    local headers = {
+        ["Content-Type"] = "application/json",
+        ["Content-Length"] = tostring(#body),
+        ["X-API-Key"] = key,
+    }
+    HTTP({
+        url = base .. "/feed",
+        method = "POST",
+        body = body,
+        headers = headers,
+        success = function() end,
+        failed = function()
+            etr_api_available = false
+        end,
+    })
+end
+
+function ETR_SubmitBan(steamID64, reason, duration_minutes)
+    steamID64 = to_steamid64(steamID64)
+    if not steamID64 then return end
+    local key = get_key()
+    if key == "" then return end
+    local base = get_base()
+    if base == "" then return end
+    local reason_str = type(reason) == "string" and reason:sub(1, 512) or "Server ban"
+    local body = util.TableToJSON({
+        steam_id = steamID64,
+        vote_type = "for",
+        reason = reason_str,
+        comment = duration_minutes and ("duration_min:" .. tostring(duration_minutes)) or "",
+    })
+    if not body then return end
+    local headers = {
+        ["Content-Type"] = "application/json",
+        ["Content-Length"] = tostring(#body),
+        ["X-API-Key"] = key,
+    }
+    HTTP({
+        url = base .. "/vote",
+        method = "POST",
+        body = body,
+        headers = headers,
+        success = function() end,
+        failed = function()
+            etr_api_available = false
+        end,
+    })
+end
+
+local function on_server_ban(steamID64, reason, duration_minutes)
+    if get_key() == "" then return end
+    steamID64 = to_steamid64(steamID64)
+    if not steamID64 then return end
+    ETR_SubmitBan(steamID64, reason or "Server ban", duration_minutes)
+end
+
+hook.Add("ETR_ReportBan", "ETR_Submit", function(steamID64, reason, duration_minutes)
+    on_server_ban(steamID64, reason, duration_minutes)
+end)
+
+hook.Add("FAdmin_PlayerBanned", "ETR", function(ply, banner, reason, duration)
+    if not IsValid(ply) then return end
+    local sid64 = ply:SteamID64()
+    if sid64 then on_server_ban(tostring(sid64), reason, duration and (duration / 60) or nil) end
+end)
+
+if rawget(_G, "ULib") and ULib.ban then
+    hook.Add("ULibPlayerBanned", "ETR", function(steamID, time, reason)
+        local sid64 = to_steamid64(steamID)
+        if sid64 then on_server_ban(sid64, reason, time and (time / 60) or nil) end
+    end)
+end
+
+gameevent.Listen("server_addban")
+hook.Add("server_addban", "ETR", function(data)
+    if not data or not data.networkid then return end
+    local sid64 = to_steamid64(data.networkid)
+    if not sid64 then return end
+    local dur = data.duration
+    on_server_ban(sid64, data.name and ("Ban: " .. tostring(data.name)) or "Server ban", (type(dur) == "number" and dur > 0) and (dur / 60) or nil)
+end)
+
+hook.Add("CheckPassword", "ETR", function(steamID64, ipAddress, svPassword, clPassword, name)
+    cv()
+    if not cv_enabled or cv_enabled:GetInt() == 0 then return end
+    steamID64 = tostring(steamID64)
+    if not valid_steamid64(steamID64) then return end
+    steamID64 = steamID64:sub(1, STEAMID64_LEN)
+    local cached = get_cached(steamID64)
+    if cached == true then
+        return false, ETR_REJECT_MSG
+    end
+    if cached == false then
+        return
+    end
+    local fail_open = (cv_fail_open and cv_fail_open:GetInt() ~= 0)
+    local strict_first = (cv_strict_first and cv_strict_first:GetInt() ~= 0)
+    -- API previously failed (e.g. unreachable): allow and re-check in background
+    if not etr_api_available and fail_open then
+        check_player(steamID64, function(banned)
+            if banned then
+                for _, p in ipairs(player.GetAll()) do
+                    if IsValid(p) and tostring(p:SteamID64()) == steamID64 then
+                        p:Kick(ETR_REJECT_MSG)
+                        break
+                    end
+                end
+            end
+        end)
+        return
+    end
+    if strict_first then
+        check_player(steamID64, function() end)
+        return false, ETR_STRICT_MSG
+    end
+    check_player(steamID64, function(banned)
+        if not banned then return end
+        for _, p in ipairs(player.GetAll()) do
+            if IsValid(p) and tostring(p:SteamID64()) == steamID64 then
+                p:Kick(ETR_REJECT_MSG)
+                break
+            end
+        end
+    end)
+    if fail_open then return end
+    return false, ETR_STRICT_MSG
+end)
+
+timer.Create("ETR_Refresh", 60, 0, function()
+    cv()
+    local key = get_key()
+    if key ~= "" and not etr_registered then register_server() end
+    local ttl = (cv_cache_ttl and cv_cache_ttl:GetInt()) or 300
+    local t = CurTime()
+    for sid, at in pairs(etr_cache_time) do
+        if t - at > ttl then
+            etr_cache[sid] = nil
+            etr_cache_time[sid] = nil
+        end
+    end
+end)
+
+local etr_periodic_next = 0
+timer.Create("ETR_PeriodicCheck", 1, 0, function()
+    cv()
+    local interval = (cv_periodic_interval and cv_periodic_interval:GetInt()) or 0
+    if interval <= 0 or get_key() == "" then return end
+    if not etr_api_available then return end
+    local t = CurTime()
+    if t < etr_periodic_next then return end
+    etr_periodic_next = t + interval
+    for _, ply in ipairs(player.GetAll()) do
+        if IsValid(ply) then
+            local sid64 = ply:SteamID64()
+            if sid64 then
+                sid64 = tostring(sid64):sub(1, STEAMID64_LEN)
+                if valid_steamid64(sid64) then
+                    check_player(sid64, function(banned)
+                        if not banned then return end
+                        if IsValid(ply) and tostring(ply:SteamID64()) == sid64 then
+                            ply:Kick(ETR_REJECT_MSG)
+                            log("Periodic kick: " .. sid64)
+                        end
+                    end)
+                end
+            end
+        end
+    end
+end)
+
+cvars.AddChangeCallback("etr_apikey", function(_, old, new)
+    if new and new ~= "" then
+        etr_registered = false
+        timer.Simple(1, register_server)
+    end
+end, "ETR")
+
+local function collect_steam_ids_from_sources()
+    local out = {}
+    local seen = {}
+    local function add(sid64)
+        if sid64 and not seen[sid64] then
+            seen[sid64] = true
+            out[#out + 1] = sid64
+        end
+    end
+    local custom = hook.Call("ETR_GetBansToPush")
+    if type(custom) == "table" then
+        for _, row in ipairs(custom) do
+            local sid = (type(row) == "table" and (row.steamid64 or row.steamid)) or row
+            add(to_steamid64(sid))
+        end
+        if #out > 0 then return out, "custom" end
+    end
+    local fadmin = rawget(_G, "FAdmin")
+    if fadmin and type(fadmin.BANS) == "table" then
+        for steamid, _ in pairs(fadmin.BANS) do
+            add(to_steamid64(steamid))
+        end
+        if #out > 0 then return out, "FAdmin" end
+    end
+    local ulib = rawget(_G, "ULib")
+    if ulib and type(ulib.bans) == "table" then
+        for steamid, _ in pairs(ulib.bans) do
+            add(to_steamid64(steamid))
+        end
+        if #out > 0 then return out, "ULib" end
+    end
+    return nil, nil
+end
+
+concommand.Add("etr_pushbans", function(ply, cmd, args)
+    if IsValid(ply) and not ply:IsSuperAdmin() then return end
+    cv()
+    if get_key() == "" then
+        print("[ETR] Set etr_apikey first.")
+        return
+    end
+    local arg = args[1]
+    if arg and arg ~= "" then
+        local sid64 = to_steamid64(arg)
+        if sid64 then
+            ETR_SubmitBan(sid64, "Pushed from server", nil)
+            log("Pushed: " .. arg)
+        end
+        return
+    end
+    local ids, source = collect_steam_ids_from_sources()
+    if not ids or #ids == 0 then
+        log("No ban source. Use etr_pushbans <steamid> or hook ETR_GetBansToPush.")
+        return
+    end
+    for i = 1, #ids, FEED_MAX do
+        local chunk = {}
+        for j = i, math.min(i + FEED_MAX - 1, #ids) do
+            chunk[#chunk + 1] = ids[j]
+        end
+        send_feed(chunk, source and (source .. " ban list") or "Server ban list", "etr_pushbans")
+    end
+    log("Pushed " .. #ids .. " IDs via feed (" .. (source or "list") .. ").")
+end, nil, "etr_pushbans [steamid]", 0)
+
+timer.Simple(2, function()
+    cv()
+    if get_key() ~= "" then register_server() end
+end)
+
+log("ETR loaded.")

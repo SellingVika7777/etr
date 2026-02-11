@@ -1,0 +1,5 @@
+{
+  "title": "ETR (Eblan Trouble Register)",
+  "type": "ServerContent",
+  "ignore": [ "*.md", "*.cfg" ]
+}
