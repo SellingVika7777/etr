@@ -39,18 +39,18 @@ local function hmac_sha256(key, msg)
     return util.SHA256(op .. inner)
 end
 
-CreateConVar("etr_apikey", "", FCVAR_PROTECTED + FCVAR_NOTIFY, "", 0, 0)
-CreateConVar("etr_api_secret", "", FCVAR_PROTECTED, "", 0, 0)
-CreateConVar("etr_setup_token", "", FCVAR_PROTECTED, "", 0, 0)
-CreateConVar("etr_enabled", "1", FCVAR_ARCHIVE, "", 0, 1)
-CreateConVar("etr_api_base", ETR_API_BASE, FCVAR_ARCHIVE, "", 0, 0)
-CreateConVar("etr_debug", "0", FCVAR_ARCHIVE, "", 0, 1)
-CreateConVar("etr_cache_ttl", "3600", FCVAR_ARCHIVE, "", 60, 86400)
-CreateConVar("etr_fail_open", "1", FCVAR_ARCHIVE, "", 0, 1)
-CreateConVar("etr_periodic_interval", "600", FCVAR_ARCHIVE, "", 0, 3600)
-CreateConVar("etr_strict_first", "0", FCVAR_ARCHIVE, "", 0, 1)
-CreateConVar("etr_vote_reason_id", "1", FCVAR_ARCHIVE, "", 1, 100)
-CreateConVar("etr_kick_message", "", FCVAR_ARCHIVE, "", 0, 0)
+CreateConVar("etr_apikey", "", FCVAR_PROTECTED + FCVAR_NOTIFY, "", 0, 0)             -- API key from sellingvika.party (required)
+CreateConVar("etr_api_secret", "", FCVAR_PROTECTED, "", 0, 0)                      -- (optional) API secret for HMAC-SHA256 request signing
+CreateConVar("etr_setup_token", "", FCVAR_PROTECTED, "", 0, 0)                     -- One-time setup token for new server registration
+CreateConVar("etr_enabled", "1", FCVAR_ARCHIVE, "", 0, 1)                          -- 1 = check players on connect, 0 = disabled
+CreateConVar("etr_api_base", ETR_API_BASE, FCVAR_ARCHIVE, "", 0, 0)               -- API base URL (change only for custom backend)
+CreateConVar("etr_debug", "0", FCVAR_ARCHIVE, "", 0, 1)                            -- 1 = print debug logs to console, 0 = silent
+CreateConVar("etr_cache_ttl", "3600", FCVAR_ARCHIVE, "", 60, 86400)                -- Cache duration in seconds (60-86400)
+CreateConVar("etr_fail_open", "1", FCVAR_ARCHIVE, "", 0, 1)                        -- 1 = allow players when API is down, 0 = block
+CreateConVar("etr_periodic_interval", "600", FCVAR_ARCHIVE, "", 0, 3600)           -- Recheck online players every N seconds (0 = off)
+CreateConVar("etr_strict_first", "0", FCVAR_ARCHIVE, "", 0, 1)                     -- 1 = block until API responds, 0 = allow and check async
+CreateConVar("etr_vote_reason_id", "1", FCVAR_ARCHIVE, "", 1, 100)                 -- Reason ID for /vote endpoint (1-100)
+CreateConVar("etr_kick_message", "", FCVAR_ARCHIVE, "", 0, 0)                      -- Custom kick message (empty = default English)
 
 local cv = {}
 local function refresh_cv()
