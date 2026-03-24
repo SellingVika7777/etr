@@ -1,123 +1,129 @@
-# ETR Addon для Garry's Mod
+# ETR Addon for Garry's Mod
 
-Аддон подключает ваш GMod-сервер к **ETR (Eblan Trouble Register)** — общему реестру блокировок: [https://sellingvika.party/etr](https://sellingvika.party/etr).
-
----
-
-## Как это работает
-
-1. **При заходе игрока** сервер запрашивает у ETR статус по Steam ID. Если игрок в реестре ETR — подключение отклоняется, игрок видит сообщение о блокировке. Результат проверки **кэшируется** (по умолчанию на 1 час): при повторном заходе того же игрока API не вызывается, берётся сохранённый результат. Раз в час кэш по игроку сбрасывается.
-2. **Сервер регистрируется** в ETR по API-ключу (имя и IP). Так ключ привязывается к серверу.
-3. **Баны с вашего сервера** можно отправлять в ETR: при бане через FAdmin/ULX/движок аддон отправляет голос «за» по этому Steam ID. Командой `etr_pushbans` можно разом отправить весь бан-лист (feed).
-
-Специальные права на ключе (например list) не нужны — используются только проверка статуса, регистрация сервера, голос и feed.
+Connects your GMod server to **ETR (Eblan Trouble Register)** — a shared ban registry: [https://sellingvika.party/etr](https://sellingvika.party/etr).
 
 ---
 
-## Что нужно сделать
+## How It Works
 
-### 1. Установить аддон
+1. **On player connect** the server checks the player's Steam ID against ETR. If the player is in the registry, the connection is rejected. Results are **cached** (default 1 hour).
+2. **Server registers** with ETR via API key (hostname, IP, player count).
+3. **Bans from your server** are reported to ETR: FAdmin, ULX, SAM, or engine bans automatically send a vote. The `etr_pushbans` command sends the entire ban list at once (feed).
+4. **On startup** the addon validates the API key via `/key-info` and logs available permissions.
 
-Скопируйте папку аддона в каталог аддонов GMod, например:
+---
+
+## Installation
+
+### 1. Install the addon
+
+Copy the addon folder to your GMod addons directory:
 
 ```
 garrysmod/addons/etr_addon/
 ```
 
-Структура внутри: `lua/autorun/server/sv_etr.lua` и остальные файлы.
+### 2. Get an API key
 
-### 2. Получить API-ключ
+- Go to [https://sellingvika.party/etr](https://sellingvika.party/etr)
+- Log in or register
+- Create an API key in your dashboard
 
-- Зайдите на [https://sellingvika.party/etr](https://sellingvika.party/etr).
-- Войдите или зарегистрируйтесь.
-- Создайте API-ключ в личном кабинете (раздел для ключей/настроек).
+### 3. Set the key on your server
 
-### 3. Прописать ключ на сервере
-
-В `server.cfg` (или в конфиге, который выполняется при старте сервера) добавьте:
+In `server.cfg`:
 
 ```
-etr_apikey "ваш_ключ_из_сайта"
+etr_apikey "your_key_here"
 ```
 
-После перезапуска карты или сервера аддон подхватит ключ, зарегистрирует сервер в ETR и начнёт проверять подключающихся игроков.
+After a map restart the addon will register the server and start checking players.
 
-### 4. (По желанию) Отправить текущие баны в ETR
+### 4. (Optional) Push existing bans to ETR
 
-В консоли сервера (или по RCON), с правами супер-админа:
+In server console (superadmin only):
 
 ```
 etr_pushbans
 ```
 
-Будут собраны баны из FAdmin или ULib (если стоят) и отправлены в ETR пачкой (feed). Один Steam ID можно отправить так:
+Collects bans from FAdmin, ULib, or SAM and sends them via feed. Single Steam ID:
 
 ```
 etr_pushbans STEAM_0:0:12345678
 ```
 
-Дальше при новых банах через поддерживаемые админки аддон сам будет отправлять голос «за» в ETR (если ключ указан).
-
 ---
 
-## Настройки (ConVars)
+## Configuration (ConVars)
 
-| Переменная | По умолчанию | Описание |
-|------------|--------------|----------|
-| `etr_apikey` | `""` | API-ключ ETR. **Обязательно** для работы. |
-| `etr_enabled` | `1` | Включить проверку при подключении: `1` — да, `0` — выключено. |
-| `etr_api_base` | `https://sellingvika.party/etr/v3` | Базовый URL ETR API v3. Менять только если у вас свой бэкенд. |
-| `etr_debug` | `0` | `1` — писать отладочные сообщения в консоль сервера. |
-| `etr_cache_ttl` | `3600` | Сколько секунд хранить результат проверки по игроку (60–86400). По умолчанию 1 час — одного захода хватает, повторно не дергаем API. |
-| `etr_fail_open` | `1` | Если API недоступен: `1` — впускать игроков, `0` — нет. |
-| `etr_periodic_interval` | `600` | Раз в сколько секунд перепроверять уже зашедших игроков. `0` — не перепроверять. |
-| `etr_strict_first` | `0` | При первом заходе, пока нет кэша: `1` — не пускать с сообщением «подключитесь через 15 сек», `0` — пускать и проверять в фоне. |
+| ConVar | Default | Description |
+|--------|---------|-------------|
+| `etr_apikey` | `""` | ETR API key. **Required.** |
+| `etr_enabled` | `1` | Enable player checking on connect. |
+| `etr_api_base` | `https://sellingvika.party/etr/v3` | API base URL. Only change for custom backends. Validated for HTTPS and no internal addresses. |
+| `etr_debug` | `0` | `1` to print debug messages to server console. |
+| `etr_cache_ttl` | `3600` | Cache duration in seconds (60–86400). |
+| `etr_fail_open` | `1` | If API is unavailable: `1` = allow players, `0` = block. |
+| `etr_periodic_interval` | `600` | Recheck interval for online players (seconds). `0` = disabled. |
+| `etr_strict_first` | `0` | `1` = block on first connect until API responds, `0` = allow and check in background. |
+| `etr_vote_reason_id` | `1` | Numeric reason ID for `/vote` endpoint (1–100). |
+| `etr_kick_message` | `""` | Custom kick message. Empty uses the default English message. |
 
-Пример блока в конфиге:
+Example config:
 
 ```
-etr_apikey "ваш_ключ"
+etr_apikey "your_key"
 etr_enabled 1
 etr_fail_open 1
 etr_periodic_interval 600
+etr_vote_reason_id 1
+etr_kick_message ""
 ```
 
 ---
 
-## Команды
+## Commands
 
-- **`etr_pushbans`** — отправить в ETR все баны из FAdmin/ULib или из хука `ETR_GetBansToPush` (пачкой через feed). Только супер-админ.
-- **`etr_pushbans <steamid>`** — отправить один Steam ID голосом «за» (vote). Пример: `etr_pushbans STEAM_0:0:12345678`.
+| Command | Description |
+|---------|-------------|
+| `etr_pushbans` | Push all bans from FAdmin/ULib/SAM to ETR via feed. Superadmin only. |
+| `etr_pushbans <steamid>` | Push a single Steam ID as a vote. |
+| `etr_keyinfo` | Check API key permissions. |
+| `etr_stats` | Show session statistics (checks, blocks, errors, retries, cache/queue size). |
+| `etr_whitelist add <steamid>` | Add a Steam ID to the local whitelist (skips ETR checks). |
+| `etr_whitelist remove <steamid>` | Remove a Steam ID from the whitelist. |
+| `etr_whitelist list` | List all whitelisted Steam IDs. |
+| `etr_whitelist reload` | Reload whitelist from file. |
 
 ---
 
-## Интеграция с админками и своей базой банов
+## Admin Mod Integration
 
-### Автоматическая отправка при бане
+Automatic ban reporting is supported for:
 
-Поддерживаются:
+- **FAdmin** — `FAdmin_PlayerBanned` hook
+- **ULX/ULib** — `ULibPlayerBanned` hook
+- **SAM** — `sam.player.banned` hook
+- **Engine bans** — `server_addban` game event
 
-- **FAdmin** — при бане через FAdmin аддон сам отправляет голос в ETR.
-- **ULX/ULib** — при бане через ULib/ULX.
-- **Любая админка через движок** — срабатывает общий событие `server_addban`, аддон отправляет голос.
+### Custom admin system
 
-### Своя админка или своя база банов
-
-**Когда вы баните игрока в своей системе**, вызовите на сервере:
+Report a ban manually:
 
 ```lua
 hook.Run("ETR_ReportBan", steamID64, reason, duration_minutes)
 ```
 
-или глобальную функцию:
+or:
 
 ```lua
 ETR_SubmitBan(steamID64, reason, duration_minutes)
 ```
 
-Так вы отправите один голос «за» в ETR. `reason` и `duration_minutes` опциональны.
+The text reason goes into the `comment` field; the numeric `reason_id` comes from the `etr_vote_reason_id` ConVar.
 
-**Чтобы по команде `etr_pushbans` подставлялся ваш список банов**, добавьте в свой аддон хук и верните таблицу:
+To provide a custom ban list for `etr_pushbans`:
 
 ```lua
 hook.Add("ETR_GetBansToPush", "MyAddon", function()
@@ -128,16 +134,36 @@ hook.Add("ETR_GetBansToPush", "MyAddon", function()
 end)
 ```
 
-Подойдёт и просто массив Steam ID (строк), и таблицы с полями `steamid64` или `steamid`, `reason`.
+---
+
+## Hooks (for other addons)
+
+| Hook | Arguments | Description |
+|------|-----------|-------------|
+| `ETR_PlayerChecked` | `steamid64, banned` | Fired after every status check completes. |
+| `ETR_PlayerBlocked` | `steamid64, name, source` | Fired when a player is kicked. `source`: `"cache"`, `"async"`, `"periodic"`. |
+| `ETR_ReportBan` | `steamid, reason, duration_minutes` | Call this to report a ban to ETR. |
+| `ETR_GetBansToPush` | *(none)* | Return a table of ban entries for `etr_pushbans`. |
 
 ---
 
-## Кратко: что делает аддон
+## Whitelist
 
-- При **подключении** проверяет игрока через ETR API (status). В реестре — кик с сообщением о блокировке ETR.
-- **Регистрирует сервер** в ETR (имя, IP, app_id 4020).
-- При **бане на сервере** (FAdmin, ULib, server_addban или ваш вызов) отправляет голос «за» или feed в ETR.
-- Команда **`etr_pushbans`** — отправить текущий бан-лист в ETR пачкой (feed).
+The whitelist is stored in `garrysmod/data/etr_whitelist.txt`, one Steam ID per line. Lines starting with `#` are ignored. Whitelisted players skip ETR checks entirely.
 
-Документация API: [ETR API (Вики)](https://sellingvika.party/wiki).
-# etr
+---
+
+## Features
+
+- **Retry queue** — failed votes and feeds are queued (up to 50 items, 3 retries each) and automatically resent when the API recovers.
+- **Exponential backoff** — rate limit delays escalate: 60s, 120s, 240s... up to 15 minutes on repeated 429 responses.
+- **Rate limit tracking** — `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers are parsed from every response.
+- **SSRF protection** — API base URL is validated for HTTPS and blocked for localhost/internal ranges.
+- **Cache limit** — max 10,000 entries to prevent memory growth.
+- **Input sanitization** — Steam IDs are validated by format and length before API calls.
+- **request_id logging** — API error responses include the `request_id` for debugging with ETR developers.
+- **Dual auth headers** — both `X-API-Key` and `Authorization: Bearer` are sent for compatibility.
+- **Player count** — server update payload includes `player_count` and `max_players`.
+- **Session statistics** — `etr_stats` command shows checks, blocks, errors, retries, cache and queue size.
+
+API documentation: [ETR API Wiki](https://sellingvika.party/wiki).
