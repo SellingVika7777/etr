@@ -1,7 +1,7 @@
 -- ETR (Eblan Trouble Register) server addon. SellingVika. https://sellingvika.party/etr
 if not SERVER then return end
 
-local ETR_VERSION = "2.0.0"
+local ETR_VERSION = "2.1.0"
 local ETR_API_BASE = "https://sellingvika.party/etr/v3"
 local ETR_DEFAULT_REJECT_MSG = "You are blocked by ETR (Eblan Trouble Register).\nMore info: https://sellingvika.party/etr"
 local ETR_DEFAULT_STRICT_MSG = "[ETR] Please reconnect in 15 seconds."
@@ -13,7 +13,6 @@ local ADD_BULK_MAX = 200
 local CACHE_MAX_SIZE = 10000
 local RETRY_MAX = 3
 local RETRY_QUEUE_MAX = 50
-local WHITELIST_FILE = "etr_whitelist.txt"
 local CREDS_FILE = "etr_credentials.json"
 local BATCH_INTERVAL = 3
 local DEFAULT_HB_INTERVAL = 10800
@@ -39,18 +38,18 @@ local function hmac_sha256(key, msg)
     return util.SHA256(op .. inner)
 end
 
-CreateConVar("etr_apikey", "", FCVAR_PROTECTED + FCVAR_NOTIFY, "", 0, 0)             -- API key from sellingvika.party (required)
-CreateConVar("etr_api_secret", "", FCVAR_PROTECTED, "", 0, 0)                      -- (optional) API secret for HMAC-SHA256 request signing
-CreateConVar("etr_setup_token", "", FCVAR_PROTECTED, "", 0, 0)                     -- One-time setup token for new server registration
-CreateConVar("etr_enabled", "1", FCVAR_ARCHIVE, "", 0, 1)                          -- 1 = check players on connect, 0 = disabled
-CreateConVar("etr_api_base", ETR_API_BASE, FCVAR_ARCHIVE, "", 0, 0)               -- API base URL (change only for custom backend)
-CreateConVar("etr_debug", "0", FCVAR_ARCHIVE, "", 0, 1)                            -- 1 = print debug logs to console, 0 = silent
-CreateConVar("etr_cache_ttl", "3600", FCVAR_ARCHIVE, "", 60, 86400)                -- Cache duration in seconds (60-86400)
-CreateConVar("etr_fail_open", "1", FCVAR_ARCHIVE, "", 0, 1)                        -- 1 = allow players when API is down, 0 = block
-CreateConVar("etr_periodic_interval", "600", FCVAR_ARCHIVE, "", 0, 3600)           -- Recheck online players every N seconds (0 = off)
-CreateConVar("etr_strict_first", "0", FCVAR_ARCHIVE, "", 0, 1)                     -- 1 = block until API responds, 0 = allow and check async
-CreateConVar("etr_vote_reason_id", "1", FCVAR_ARCHIVE, "", 1, 100)                 -- Reason ID for /vote endpoint (1-100)
-CreateConVar("etr_kick_message", "", FCVAR_ARCHIVE, "", 0, 0)                      -- Custom kick message (empty = default English)
+CreateConVar("etr_apikey", "", FCVAR_PROTECTED + FCVAR_NOTIFY, "", 0, 0)         -- API key from sellingvika.party (required)
+CreateConVar("etr_api_secret", "", FCVAR_PROTECTED, "", 0, 0)                    -- API secret for HMAC-SHA256 signing (optional, from dashboard)
+CreateConVar("etr_setup_token", "", FCVAR_PROTECTED, "", 0, 0)                   -- One-time token for new server registration (consumed after use)
+CreateConVar("etr_enabled", "1", FCVAR_ARCHIVE, "", 0, 1)                        -- 1 = check players on connect, 0 = disabled
+CreateConVar("etr_api_base", ETR_API_BASE, FCVAR_ARCHIVE, "", 0, 0)             -- API base URL (change only for custom backend)
+CreateConVar("etr_debug", "0", FCVAR_ARCHIVE, "", 0, 1)                          -- 1 = print debug logs to server console, 0 = silent
+CreateConVar("etr_cache_ttl", "3600", FCVAR_ARCHIVE, "", 60, 86400)              -- Cache duration in seconds (min 60, max 86400)
+CreateConVar("etr_fail_open", "1", FCVAR_ARCHIVE, "", 0, 1)                      -- API down behavior: 1 = allow players in, 0 = block until API responds
+CreateConVar("etr_periodic_interval", "600", FCVAR_ARCHIVE, "", 0, 3600)         -- Recheck online players every N seconds (0 = disabled)
+CreateConVar("etr_strict_first", "0", FCVAR_ARCHIVE, "", 0, 1)                   -- 1 = block player until API responds on first connect, 0 = allow and check async
+CreateConVar("etr_vote_reason_id", "1", FCVAR_ARCHIVE, "", 1, 100)               -- Reason ID sent with /vote endpoint (1-100)
+CreateConVar("etr_kick_message", "", FCVAR_ARCHIVE, "", 0, 0)                    -- Custom kick message shown to blocked players (empty = default English)
 
 local cv = {}
 local function refresh_cv()
@@ -77,7 +76,6 @@ local state = {
     cache = {},
     cache_time = {},
     pending = {},
-    whitelist = {},
     retry_queue = {},
     batch_queue = {},
     consecutive_429 = 0,
@@ -104,7 +102,6 @@ local stats = {
     votes = 0,
     adds = 0,
     retries = 0,
-    whitelisted = 0,
     heartbeats = 0,
 }
 
@@ -416,37 +413,6 @@ local function clean_expired_cache()
     end
 end
 
-local function load_whitelist()
-    state.whitelist = {}
-    if not file.Exists(WHITELIST_FILE, "DATA") then return end
-    local content = file.Read(WHITELIST_FILE, "DATA")
-    if not content then return end
-    for line in content:gmatch("[^\r\n]+") do
-        line = string.Trim(line)
-        if line ~= "" and not line:match("^#") then
-            local sid = to_steamid64(line) or line
-            state.whitelist[sid] = true
-        end
-    end
-    log("Whitelist: " .. table.Count(state.whitelist) .. " entries")
-end
-
-local function save_whitelist()
-    local lines = {}
-    for sid in pairs(state.whitelist) do lines[#lines + 1] = sid end
-    table.sort(lines)
-    file.Write(WHITELIST_FILE, table.concat(lines, "\n"))
-end
-
-local function is_whitelisted(steamid)
-    if table.Count(state.whitelist) == 0 then return false end
-    local sid64 = to_steamid64(steamid)
-    if sid64 and state.whitelist[sid64] then return true end
-    local api_id = steamid_for_api(steamid)
-    if api_id and state.whitelist[api_id] then return true end
-    return false
-end
-
 local function on_registered(api_key, api_secret, server_id, server_name)
     state.registered = true
     state.server_id = server_id and tostring(server_id) or nil
@@ -466,11 +432,23 @@ local function register_with_token()
     if hostname == "" then hostname = "GMod Server" end
     local server_ip = game.GetIPAddress and game.GetIPAddress() or "0.0.0.0"
     if server_ip == "loopback" then server_ip = "0.0.0.0" end
+    local ip_part = server_ip
+    local port_part = ""
+    if server_ip:find(":") then
+        ip_part = server_ip:match("^(.+):(%d+)$") or server_ip
+        port_part = server_ip:match(":(%d+)$") or ""
+    end
     api_request({
         method = "POST",
         path = "/servers/register",
         no_auth = true,
-        body = { setup_token = token, name = hostname, ip = server_ip },
+        body = {
+            setup_token = token,
+            name = hostname,
+            ip = ip_part,
+            port = port_part,
+            app_id = tostring(engine.ActiveGamemode and engine.ActiveGamemode() or "garrysmod"),
+        },
         extra_headers = { ["X-Setup-Token"] = token },
         on_success = function(code, body)
             if code >= 200 and code < 300 and body and body ~= "" then
@@ -883,11 +861,6 @@ hook.Add("CheckPassword", "ETR", function(steamID64, ipAddress, svPassword, clPa
     if not cv.enabled or cv.enabled:GetInt() == 0 then return end
     local steamid = steamid_for_api(steamID64)
     if not steamid then return end
-    if is_whitelisted(steamID64) then
-        stats.whitelisted = stats.whitelisted + 1
-        log("Whitelisted: " .. steamid)
-        return
-    end
     local cached = get_cached(steamID64)
     if cached == true then
         stats.blocks = stats.blocks + 1
@@ -987,7 +960,6 @@ concommand.Add("etr_stats", function(ply)
     print("[ETR] Session statistics:")
     print("  Checks:        " .. stats.checks)
     print("  Blocks:        " .. stats.blocks)
-    print("  Whitelisted:   " .. stats.whitelisted)
     print("  Votes sent:    " .. stats.votes)
     print("  Bulk adds:     " .. stats.adds)
     print("  Heartbeats:    " .. stats.heartbeats)
@@ -996,7 +968,6 @@ concommand.Add("etr_stats", function(ply)
     print("  Retry queue:   " .. #state.retry_queue)
     print("  Batch queue:   " .. #state.batch_queue)
     print("  Cache size:    " .. table.Count(state.cache))
-    print("  Whitelist:     " .. table.Count(state.whitelist))
     print("  API available: " .. tostring(state.api_available))
     print("  Rate daily:    " .. tostring(rate.daily_remaining or "n/a") .. "/" .. tostring(rate.daily_limit or "n/a"))
     print("  Rate minute:   " .. tostring(rate.minute_remaining or "n/a") .. "/" .. tostring(rate.minute_limit or "n/a"))
@@ -1056,33 +1027,6 @@ concommand.Add("etr_add", function(ply, cmd, args)
     })
 end, nil, "Directly add Steam ID to ETR (admin key required)", 0)
 
-concommand.Add("etr_whitelist", function(ply, cmd, args)
-    if IsValid(ply) and not ply:IsSuperAdmin() then return end
-    local action = args[1]
-    if action == "add" and args[2] then
-        local sid = to_steamid64(args[2]) or steamid_for_api(args[2])
-        if not sid then print("[ETR] Invalid Steam ID.") return end
-        state.whitelist[sid] = true
-        save_whitelist()
-        print("[ETR] Added " .. sid .. " to whitelist.")
-    elseif action == "remove" and args[2] then
-        local sid = to_steamid64(args[2]) or steamid_for_api(args[2])
-        if not sid then print("[ETR] Invalid Steam ID.") return end
-        state.whitelist[sid] = nil
-        save_whitelist()
-        print("[ETR] Removed " .. sid .. " from whitelist.")
-    elseif action == "list" then
-        local count = 0
-        for sid in pairs(state.whitelist) do print("  " .. sid); count = count + 1 end
-        print("[ETR] Whitelist: " .. count .. " entries.")
-    elseif action == "reload" then
-        load_whitelist()
-        print("[ETR] Whitelist reloaded.")
-    else
-        print("[ETR] Usage: etr_whitelist <add|remove|list|reload> [steamid]")
-    end
-end, nil, "Manage ETR whitelist", 0)
-
 timer.Create("ETR_Refresh", 60, 0, function()
     refresh_cv()
     if get_key() ~= "" and not state.registered then register_server() end
@@ -1109,7 +1053,7 @@ timer.Create("ETR_PeriodicCheck", 30, 0, function()
         if #to_check >= STATUS_BULK_MAX then break end
         if IsValid(ply) then
             local sid64 = steamid64_string(ply:SteamID64())
-            if sid64 and not is_whitelisted(sid64) and get_cached(sid64) == nil then
+            if sid64 and get_cached(sid64) == nil then
                 to_check[#to_check + 1] = sid64
             end
         end
@@ -1155,7 +1099,6 @@ end, "ETR")
 
 timer.Simple(2, function()
     refresh_cv()
-    load_whitelist()
     init_credentials()
     timer.Simple(1, function()
         refresh_cv()
