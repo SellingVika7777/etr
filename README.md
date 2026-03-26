@@ -151,27 +151,6 @@ end)
 
 ---
 
-## Whitelist
-
-File: `garrysmod/data/etr_whitelist.txt` — one Steam ID per line. Lines starting with `#` are ignored.
-
-```
-# Server owner
-76561198000000000
-# Head admin
-STEAM_0:1:55555555
-```
-
-Manage via console:
-```
-etr_whitelist add 76561198000000000
-etr_whitelist remove 76561198000000000
-etr_whitelist list
-etr_whitelist reload
-```
-
----
-
 ## Credentials Storage
 
 When registering via setup token, the addon saves the returned `api_key` and `api_secret` to `garrysmod/data/etr/etr_credentials.json`. On subsequent startups, credentials are loaded automatically from this file if ConVars are empty.
