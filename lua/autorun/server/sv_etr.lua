@@ -527,7 +527,6 @@ local function check_key_info()
                     local perms = {}
                     if data.verified then perms[#perms + 1] = "verified" end
                     if data.can_add_users then perms[#perms + 1] = "can_add" end
-                    if data.can_check_list then perms[#perms + 1] = "can_list" end
                     log("Key: " .. (#perms > 0 and table.concat(perms, ", ") or "basic"))
                 end
             else

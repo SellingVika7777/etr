@@ -96,10 +96,6 @@ All commands require **superadmin** privileges.
 | `etr_stats` | Show session statistics: checks, blocks, errors, retries, cache size, rate limits, heartbeat status. |
 | `etr_votings` | Show all active votings (players being voted on but not yet in ETR). |
 | `etr_add <steamid> [reason]` | Directly add a player to ETR (requires `can_add_users` permission). |
-| `etr_whitelist add <steamid>` | Add to local whitelist (skips ETR checks). |
-| `etr_whitelist remove <steamid>` | Remove from whitelist. |
-| `etr_whitelist list` | List all whitelisted Steam IDs. |
-| `etr_whitelist reload` | Reload whitelist from file. |
 
 ---
 
