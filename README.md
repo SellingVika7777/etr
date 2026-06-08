@@ -12,7 +12,9 @@ Connects your GMod server to **ETR (Eblan Trouble Register)** — a shared ban r
 2. **Connect batching** — multiple simultaneous connections are batched into a single `/status-bulk` API call to minimize request usage.
 3. **Heartbeat** — the server sends periodic heartbeats to ETR. The API dynamically tells the addon when to send the next one (typically every few hours).
 4. **Bans from your server** are reported to ETR: FAdmin, ULX, SAM, or engine bans automatically send a vote. The `etr_pushbans` command sends the entire ban list at once.
-5. **HMAC-SHA256 security** — all API requests are signed with mandatory security headers (`X-Signature`, `X-Timestamp`, `X-Nonce`, `X-Body-SHA256`, `User-Agent`).
+5. **HMAC-SHA256 security** — all API requests are signed with security headers (`X-Signature`, `X-Timestamp`, `X-Nonce`, `X-Body-SHA256`, `User-Agent`). The canonical string is `METHOD:path:body:timestamp` where `path` has **no** leading slash (e.g. `etr/v3/status/7656…`).
+6. **Clock sync** — on startup the addon calls `/time` (and reads `X-Server-Time` on every response) so HMAC timestamps stay within the API's ±2-minute tolerance even if the host clock drifts.
+7. **Reason slugs** — votes/adds send a valid reason **slug** (configurable via `etr_vote_reason`, default `other`); the human-readable reason is sent as the comment. Run `etr_reasons` for the catalog.
 
 ---
 
@@ -69,8 +71,9 @@ All settings go in `garrysmod/cfg/server.cfg`.
 | `etr_fail_open` | `1` | If API unavailable: `1` = allow players, `0` = block. |
 | `etr_periodic_interval` | `600` | Recheck online players every N seconds. `0` = disabled. |
 | `etr_strict_first` | `0` | `1` = block until API responds, `0` = allow and check in background. |
-| `etr_vote_reason_id` | `1` | Numeric reason ID for vote endpoint (1–100). |
-| `etr_kick_message` | `""` | Custom kick message. Empty = default English message. |
+| `etr_vote_reason` | `other` | Reason **slug** sent with `/vote` and `/add` (run `etr_reasons` for the list). The free-text ban reason is sent as the comment. |
+| `etr_app_id` | `4000` | Steam AppID reported on registration (Garry's Mod = 4000). |
+| `etr_kick_message` | `""` | Custom kick message. Empty = default English message. The ETR ban reason is appended automatically. |
 
 Example:
 ```
@@ -79,6 +82,7 @@ etr_api_secret "your_secret"
 etr_enabled 1
 etr_fail_open 1
 etr_periodic_interval 600
+etr_vote_reason "other"
 etr_kick_message ""
 ```
 
@@ -95,7 +99,8 @@ All commands require **superadmin** privileges.
 | `etr_keyinfo` | Check API key permissions and verification status. |
 | `etr_stats` | Show session statistics: checks, blocks, errors, retries, cache size, rate limits, heartbeat status. |
 | `etr_votings` | Show all active votings (players being voted on but not yet in ETR). |
-| `etr_add <steamid> [reason]` | Directly add a player to ETR (requires `can_add_users` permission). |
+| `etr_reasons` | List the valid reason slugs (from `/reasons`) for `etr_vote_reason`. |
+| `etr_add <steamid> [reason_slug]` | Directly add a player to ETR (requires `can_add_users` permission). `reason_slug` defaults to `etr_vote_reason`. |
 
 ---
 
@@ -113,9 +118,11 @@ Automatic ban reporting for:
 Report a ban manually:
 ```lua
 hook.Run("ETR_ReportBan", steamID64, reason, duration_minutes)
--- or
-ETR_SubmitBan(steamID64, reason, duration_minutes)
+-- or, with an optional explicit reason slug (see etr_reasons):
+ETR_SubmitBan(steamID64, reason, duration_minutes, reason_slug)
 ```
+The free-text `reason` is sent as the vote comment; the API `reason` field is the slug
+(`reason_slug` if given, otherwise the `etr_vote_reason` ConVar).
 
 Provide a custom ban list for `etr_pushbans`:
 ```lua
@@ -134,7 +141,7 @@ end)
 | Hook | Arguments | Description |
 |------|-----------|-------------|
 | `ETR_PlayerChecked` | `steamid64, banned` | Fires after every status check. |
-| `ETR_PlayerBlocked` | `steamid64, name, source` | Fires when a player is kicked. `source`: `"cache"`, `"async"`, `"periodic"`. |
+| `ETR_PlayerBlocked` | `steamid64, name, source, reason` | Fires when a player is kicked. `source`: `"cache"`, `"async"`, `"periodic"`. `reason` is the ETR ban reason (may be `nil`). |
 | `ETR_ReportBan` | `steamid, reason, duration_minutes` | Call to report a ban to ETR. |
 | `ETR_GetBansToPush` | *(none)* | Return a table of ban entries for `etr_pushbans`. |
 
@@ -155,7 +162,12 @@ When registering via setup token, the addon saves the returned `api_key` and `ap
 
 ## Features
 
-- **HMAC-SHA256 signing** — all requests include `X-Signature`, `X-Timestamp`, `X-Nonce`, `X-Body-SHA256` per API v3 spec.
+- **HMAC-SHA256 signing** — all requests include `X-Signature`, `X-Timestamp`, `X-Nonce`, `X-Body-SHA256` per API v3 spec. Canonical path has no leading slash; the body hash is sent for every write method; `Content-Type: application/json` is set via the request `type`.
+- **Startup clock sync** — calls the public `/time` endpoint before the first signed request and re-syncs hourly, so HMAC never fails with `timestamp_expired` due to clock drift.
+- **Reason-slug validation** — fetches `/reasons` and validates `etr_vote_reason` locally, falling back to `other` for unknown slugs so votes are never rejected with `invalid_reason`.
+- **Smart retries** — only transient failures (429, 5xx, network, `timestamp_expired`, `nonce_reused`) are re-queued; permanent config/validation errors are dropped instead of hammering the API.
+- **Config-error alerts** — clear one-time console warnings for `hmac_required`, `invalid_signature`, `invalid_key`, `account_not_verified`, `server_not_verified`, etc.
+- **Ban reason in kick** — the ETR reason is captured from `/status` and shown in the kick message and `ETR_PlayerBlocked` hook.
 - **Connect batching** — multiple player connections are batched into single `/status-bulk` calls (every 3 seconds) to save API quota.
 - **Dynamic heartbeat** — API tells the addon exactly when to send the next heartbeat via `next_heartbeat_in`. No fixed-interval spam.
 - **Setup token registration** — new `/servers/register` endpoint with one-time setup tokens. Credentials auto-saved.
@@ -178,6 +190,8 @@ When registering via setup token, the addon saves the returned `api_key` and `ap
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
+| `/time` | GET | Public clock sync for HMAC timestamps |
+| `/reasons` | GET | Public catalog of valid reason slugs |
 | `/servers/register` | POST | Register server with setup token |
 | `/heartbeat` | POST | Server heartbeat with dynamic interval |
 | `/key-info` | GET | Validate API key permissions |

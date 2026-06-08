@@ -1,7 +1,7 @@
 -- ETR (Eblan Trouble Register) server addon. SellingVika. https://sellingvika.party/etr
 if not SERVER then return end
 
-local ETR_VERSION = "2.1.0"
+local ETR_VERSION = "2.2.0"
 local ETR_API_BASE = "https://sellingvika.party/etr/v3"
 local ETR_DEFAULT_REJECT_MSG = "You are blocked by ETR (Eblan Trouble Register).\nMore info: https://sellingvika.party/etr"
 local ETR_DEFAULT_STRICT_MSG = "[ETR] Please reconnect in 15 seconds."
@@ -16,6 +16,9 @@ local RETRY_QUEUE_MAX = 50
 local CREDS_FILE = "etr_credentials.json"
 local BATCH_INTERVAL = 3
 local DEFAULT_HB_INTERVAL = 10800
+local DEFAULT_VOTE_REASON = "other"   -- catch-all reason slug (see GET /reasons)
+local TIME_SYNC_INTERVAL = 3600       -- re-sync clock with /time at most this often
+local DEFAULT_APP_ID = "4000"         -- Garry's Mod Steam AppID
 
 local function hex2bin(hex)
     return (hex:gsub("..", function(cc) return string.char(tonumber(cc, 16)) end))
@@ -48,7 +51,8 @@ CreateConVar("etr_cache_ttl", "3600", FCVAR_ARCHIVE, "", 60, 86400)             
 CreateConVar("etr_fail_open", "1", FCVAR_ARCHIVE, "", 0, 1)                      -- API down behavior: 1 = allow players in, 0 = block until API responds
 CreateConVar("etr_periodic_interval", "600", FCVAR_ARCHIVE, "", 0, 3600)         -- Recheck online players every N seconds (0 = disabled)
 CreateConVar("etr_strict_first", "0", FCVAR_ARCHIVE, "", 0, 1)                   -- 1 = block player until API responds on first connect, 0 = allow and check async
-CreateConVar("etr_vote_reason_id", "1", FCVAR_ARCHIVE, "", 1, 100)               -- Reason ID sent with /vote endpoint (1-100)
+CreateConVar("etr_vote_reason", DEFAULT_VOTE_REASON, FCVAR_ARCHIVE, "", 0, 0)    -- Reason slug sent with /vote and /add (see etr_reasons). Free-text reason goes in the comment.
+CreateConVar("etr_app_id", DEFAULT_APP_ID, FCVAR_ARCHIVE, "", 0, 0)              -- Steam AppID reported on registration (Garry's Mod = 4000)
 CreateConVar("etr_kick_message", "", FCVAR_ARCHIVE, "", 0, 0)                    -- Custom kick message shown to blocked players (empty = default English)
 
 local cv = {}
@@ -63,7 +67,8 @@ local function refresh_cv()
     cv.fail_open = GetConVar("etr_fail_open")
     cv.periodic = GetConVar("etr_periodic_interval")
     cv.strict = GetConVar("etr_strict_first")
-    cv.reason_id = GetConVar("etr_vote_reason_id")
+    cv.vote_reason = GetConVar("etr_vote_reason")
+    cv.app_id = GetConVar("etr_app_id")
     cv.kick_msg = GetConVar("etr_kick_message")
 end
 refresh_cv()
@@ -75,6 +80,7 @@ local state = {
     key_info = nil,
     cache = {},
     cache_time = {},
+    cache_reason = {},
     pending = {},
     retry_queue = {},
     batch_queue = {},
@@ -83,6 +89,10 @@ local state = {
     hb_interval = DEFAULT_HB_INTERVAL,
     hb_next = 0,
     server_time_offset = 0,
+    time_synced = false,
+    time_sync_next = 0,
+    valid_reasons = nil,
+    warned = {},
 }
 
 local rate = {
@@ -114,10 +124,60 @@ local function log_always(msg)
     print("[ETR] " .. tostring(msg))
 end
 
-local function get_reject_msg()
+local PERMANENT_ERRORS = {
+    invalid_key = true, account_not_verified = true, server_not_verified = true,
+    unauthorized = true, standalone_key_restricted = true, no_server = true,
+    steamid_blocked = true, hmac_required = true, invalid_signature = true,
+    invalid_steamid = true, invalid_reason = true, missing_reason = true,
+    body_hash_mismatch = true, invalid_content_type = true, validation_error = true,
+    ip_not_allowed = true, missing_parameter = true, steamid_missing = true,
+    missing_nonce = true, nonce_too_short = true, nonce_too_long = true, missing_body_hash = true,
+}
+
+local CONFIG_ERRORS = {
+    invalid_key = "API key invalid or inactive. Check etr_apikey.",
+    hmac_required = "This API key requires HMAC signing. Set etr_api_secret in server.cfg.",
+    invalid_signature = "HMAC signature rejected. Verify etr_api_secret and the server clock.",
+    account_not_verified = "ETR account not verified. Finish Steam + email verification on sellingvika.party.",
+    server_not_verified = "Server not verified yet. Votes are rejected until an ETR admin verifies this server.",
+    unauthorized = "API key lacks permission for this action.",
+    standalone_key_restricted = "Standalone key cannot use this endpoint.",
+    ip_not_allowed = "This server's IP is not in the API key's allowlist.",
+}
+
+local function parse_error_slug(body)
+    if not body or body == "" then return nil, nil, nil end
+    local ok, data = pcall(util.JSONToTable, body)
+    if ok and type(data) == "table" then return data.error, data.message, data.request_id end
+    return nil, nil, nil
+end
+
+local function warn_once(slug, msg)
+    local now = CurTime()
+    local last = state.warned[slug]
+    if last and (now - last) < 3600 then return end
+    state.warned[slug] = now
+    log_always(msg)
+end
+
+
+local function classify_failure(code, body)
+    code = tonumber(code) or 0
+    local slug = parse_error_slug(body)
+    if slug and PERMANENT_ERRORS[slug] then return false end
+    if code == 0 then return true end                                    
+    if code == 429 or code == 409 then return true end                  
+    if code >= 500 then return true end                                  
+    if code == 403 and slug == "timestamp_expired" then return true end
+    if code == 400 and slug == "invalid_timestamp" then return true end
+    return false
+end
+
+local function get_reject_msg(reason)
     local custom = cv.kick_msg and cv.kick_msg:GetString() or ""
-    if custom ~= "" then return custom end
-    return ETR_DEFAULT_REJECT_MSG
+    local base = (custom ~= "") and custom or ETR_DEFAULT_REJECT_MSG
+    if reason and reason ~= "" then return base .. "\nReason: " .. tostring(reason) end
+    return base
 end
 
 local function validate_base_url(url)
@@ -231,9 +291,14 @@ local function init_credentials()
     return true
 end
 
+-- 24-char hex nonce: time + per-process counter guarantee uniqueness; random adds entropy. Within spec's 16-128 chars.
 local function generate_nonce()
     state.nonce_counter = state.nonce_counter + 1
-    return string.format("%d_%d_%06d", os.time(), state.nonce_counter, math.random(0, 999999))
+    return string.format("%08x%04x%06x%06x",
+        os.time() % 0xFFFFFFFF,
+        state.nonce_counter % 0xFFFF,
+        math.random(0, 0xFFFFFF),
+        math.random(0, 0xFFFFFF))
 end
 
 local function get_timestamp()
@@ -261,7 +326,7 @@ local function parse_rate_headers(headers)
             rate.minute_limit = tonumber(v)
         elseif lk == "x-server-time" then
             local st = tonumber(v)
-            if st then state.server_time_offset = st - os.time() end
+            if st then state.server_time_offset = st - os.time(); state.time_synced = true end
         end
     end
 end
@@ -273,13 +338,18 @@ local function rate_limited()
     return false
 end
 
-local function apply_rate_backoff(code)
-    if code == 429 then
-        state.consecutive_429 = state.consecutive_429 + 1
-        local delay = math.min(60 * math.pow(2, state.consecutive_429 - 1), 900)
-        rate.backoff_until = math.max(rate.backoff_until, CurTime() + delay)
-        log("Rate limited, backoff " .. math.floor(delay) .. "s (x" .. state.consecutive_429 .. ")")
+local function apply_rate_backoff(code, slug)
+    if code ~= 429 then return end
+    state.consecutive_429 = state.consecutive_429 + 1
+    if slug == "daily_limit_exceeded" then
+        local secs = (rate.reset_at and rate.reset_at > os.time()) and (rate.reset_at - os.time()) or 3600
+        rate.backoff_until = math.max(rate.backoff_until, CurTime() + secs)
+        warn_once("daily_limit", "Daily API limit reached; pausing requests for ~" .. math.floor(secs / 60) .. " min.")
+        return
     end
+    local delay = math.min(60 * math.pow(2, state.consecutive_429 - 1), 900)
+    rate.backoff_until = math.max(rate.backoff_until, CurTime() + delay)
+    log("Rate limited, backoff " .. math.floor(delay) .. "s (x" .. state.consecutive_429 .. ")")
 end
 
 local function reset_backoff()
@@ -318,17 +388,17 @@ local function api_request(opts)
         for k, v in pairs(opts.extra_headers) do headers[k] = v end
     end
 
-    if secret ~= "" and util.SHA256 then
-        local sign_msg = method .. ":" .. path_for_sign .. ":" .. body_str .. ":" .. ts
-        headers["X-Signature"] = hmac_sha256(secret, sign_msg)
+    -- Body integrity hash for every write method so HMAC-required keys never hit missing_body_hash.
+    if (method == "POST" or method == "PUT" or method == "PATCH") and util.SHA256 then
+        headers["X-Body-SHA256"] = util.SHA256(body_str)
     end
 
-    if body_str ~= "" then
-        if util.SHA256 then
-            headers["X-Body-SHA256"] = util.SHA256(body_str)
-        end
-        headers["Content-Type"] = "application/json"
-        headers["Content-Length"] = tostring(#body_str)
+    -- HMAC-SHA256 over the canonical "METHOD:path:body:timestamp" string.
+    -- Per ETR v3 spec the path carries NO leading slash (e.g. "etr/v3/status/7656...").
+    if secret ~= "" and util.SHA256 then
+        local sign_path = (path_for_sign:gsub("^/", ""))
+        local sign_msg = method .. ":" .. sign_path .. ":" .. body_str .. ":" .. ts
+        headers["X-Signature"] = hmac_sha256(secret, sign_msg)
     end
 
     local req = {
@@ -340,15 +410,19 @@ local function api_request(opts)
             if code >= 200 and code < 300 then
                 reset_backoff()
                 state.api_available = true
-            elseif code == 429 then
-                apply_rate_backoff(code)
-                state.api_available = false
-                stats.api_errors = stats.api_errors + 1
-            elseif code == 403 then
-                state.api_available = false
-                stats.api_errors = stats.api_errors + 1
             else
-                if code >= 400 then stats.api_errors = stats.api_errors + 1 end
+                local slug = parse_error_slug(res_body)
+                if slug and CONFIG_ERRORS[slug] then warn_once(slug, "CONFIG: " .. CONFIG_ERRORS[slug]) end
+                if code == 429 then
+                    apply_rate_backoff(code, slug)
+                    state.api_available = false
+                    stats.api_errors = stats.api_errors + 1
+                elseif code == 403 then
+                    state.api_available = false
+                    stats.api_errors = stats.api_errors + 1
+                elseif code >= 400 then
+                    stats.api_errors = stats.api_errors + 1
+                end
             end
             if opts.on_success then opts.on_success(code, res_body, res_headers) end
         end,
@@ -359,7 +433,10 @@ local function api_request(opts)
         end,
     }
 
-    if body_str ~= "" then req.body = body_str end
+    if body_str ~= "" then
+        req.body = body_str
+        req.type = "application/json"
+    end
     HTTP(req)
 end
 
@@ -379,6 +456,68 @@ local function log_api_error(code, body, context)
     end
 end
 
+
+local function sync_time()
+    if CurTime() < state.time_sync_next then return end
+    state.time_sync_next = CurTime() + 60
+    api_request({
+        method = "GET",
+        path = "/time",
+        no_auth = true,
+        on_success = function(code, body)
+            if code == 200 and body and body ~= "" then
+                local ok, data = pcall(util.JSONToTable, body)
+                local ts = ok and data and tonumber(data.timestamp)
+                if ts then
+                    state.server_time_offset = ts - os.time()
+                    state.time_synced = true
+                    log("Clock synced with ETR, offset " .. math.floor(state.server_time_offset) .. "s")
+                end
+            end
+            state.time_sync_next = CurTime() + TIME_SYNC_INTERVAL
+        end,
+        on_fail = function() state.time_sync_next = CurTime() + 300 end,
+    })
+end
+
+local function fetch_reasons()
+    api_request({
+        method = "GET",
+        path = "/reasons",
+        no_auth = true,
+        on_success = function(code, body)
+            if code ~= 200 or not body or body == "" then return end
+            local ok, data = pcall(util.JSONToTable, body)
+            if not ok or type(data) ~= "table" then return end
+            local set = {}
+            if type(data.categories) == "table" then
+                for _, cat in ipairs(data.categories) do
+                    if type(cat.reasons) == "table" then
+                        for _, r in ipairs(cat.reasons) do
+                            if type(r) == "table" and r.slug then set[r.slug] = r.name or r.slug end
+                        end
+                    end
+                end
+            end
+            if next(set) then
+                state.valid_reasons = set
+                log("Loaded " .. table.Count(set) .. " ETR reason slugs")
+            end
+        end,
+        on_fail = function() end,
+    })
+end
+
+local function resolve_reason_slug()
+    local s = cv.vote_reason and string.Trim(cv.vote_reason:GetString()):lower() or ""
+    if s == "" then s = DEFAULT_VOTE_REASON end
+    if state.valid_reasons and not state.valid_reasons[s] then
+        log("Unknown reason slug '" .. s .. "', falling back to '" .. DEFAULT_VOTE_REASON .. "'")
+        s = DEFAULT_VOTE_REASON
+    end
+    return s
+end
+
 local function get_cached(steamid)
     local k = to_steamid64(steamid) or steamid_for_api(steamid)
     if not k then return nil end
@@ -389,9 +528,19 @@ local function get_cached(steamid)
     return nil
 end
 
-local function set_cache(k, banned)
+local function set_cache(k, banned, reason)
     state.cache[k] = banned
     state.cache_time[k] = CurTime()
+    if banned == true then
+        state.cache_reason[k] = (type(reason) == "string" and reason ~= "") and reason or nil
+    else
+        state.cache_reason[k] = nil
+    end
+end
+
+local function get_cached_reason(steamid)
+    local k = to_steamid64(steamid) or steamid_for_api(steamid)
+    return k and state.cache_reason[k] or nil
 end
 
 local function enforce_cache_limit()
@@ -402,14 +551,22 @@ local function enforce_cache_limit()
     for sid, at in pairs(state.cache_time) do
         if not oldest_time or at < oldest_time then oldest_time = at; oldest_key = sid end
     end
-    if oldest_key then state.cache[oldest_key] = nil; state.cache_time[oldest_key] = nil end
+    if oldest_key then
+        state.cache[oldest_key] = nil
+        state.cache_time[oldest_key] = nil
+        state.cache_reason[oldest_key] = nil
+    end
 end
 
 local function clean_expired_cache()
     local ttl = (cv.cache_ttl and cv.cache_ttl:GetInt()) or 3600
     local t = CurTime()
     for sid, at in pairs(state.cache_time) do
-        if t - at > ttl then state.cache[sid] = nil; state.cache_time[sid] = nil end
+        if t - at > ttl then
+            state.cache[sid] = nil
+            state.cache_time[sid] = nil
+            state.cache_reason[sid] = nil
+        end
     end
 end
 
@@ -438,17 +595,19 @@ local function register_with_token()
         ip_part = server_ip:match("^(.+):(%d+)$") or server_ip
         port_part = server_ip:match(":(%d+)$") or ""
     end
+    local reg_body = {
+        setup_token = token,
+        name = hostname,
+        ip = ip_part,
+        app_id = (cv.app_id and cv.app_id:GetString() ~= "" and cv.app_id:GetString()) or DEFAULT_APP_ID,
+        description = "Gamemode: " .. tostring(engine.ActiveGamemode and engine.ActiveGamemode() or "unknown"),
+    }
+    if port_part ~= "" then reg_body.port = tonumber(port_part) end  -- omit when absent; numeric when present
     api_request({
         method = "POST",
         path = "/servers/register",
         no_auth = true,
-        body = {
-            setup_token = token,
-            name = hostname,
-            ip = ip_part,
-            port = port_part,
-            app_id = tostring(engine.ActiveGamemode and engine.ActiveGamemode() or "garrysmod"),
-        },
+        body = reg_body,
         extra_headers = { ["X-Setup-Token"] = token },
         on_success = function(code, body)
             if code >= 200 and code < 300 and body and body ~= "" then
@@ -554,14 +713,14 @@ local function check_player(steamid, callback)
         path = "/status/" .. api_id,
         on_success = function(code, body)
             state.pending[cache_key] = nil
-            local banned = false
+            local banned, reason = false, nil
             if code == 200 and body and body ~= "" then
                 local ok, data = pcall(util.JSONToTable, body)
-                if ok and data and data.status == true then banned = true end
+                if ok and data and data.status == true then banned = true; reason = data.reason end
             elseif code >= 400 then
                 log_api_error(code, body, "Check")
             end
-            set_cache(cache_key, banned)
+            set_cache(cache_key, banned, reason)
             enforce_cache_limit()
             hook.Run("ETR_PlayerChecked", cache_key, banned)
             if callback then callback(banned) end
@@ -593,7 +752,7 @@ local function check_players_bulk(steam_ids, callback)
         path = "/status-bulk",
         body = { steam_ids = steam_ids },
         on_success = function(code, body)
-            local banned_map = {}
+            local banned_map, reason_map = {}, {}
             if code == 200 and body and body ~= "" then
                 local ok, data = pcall(util.JSONToTable, body)
                 if ok and data then
@@ -602,7 +761,7 @@ local function check_players_bulk(steam_ids, callback)
                         for _, r in ipairs(list) do
                             if type(r) == "table" then
                                 local sid = steamid64_string(r.steam_id or r.steamid)
-                                if sid and r.status == true then banned_map[sid] = true end
+                                if sid and r.status == true then banned_map[sid] = true; reason_map[sid] = r.reason end
                             end
                         end
                     end
@@ -613,7 +772,7 @@ local function check_players_bulk(steam_ids, callback)
             for _, sid in ipairs(steam_ids) do
                 sid = steamid64_string(sid)
                 if sid then
-                    set_cache(sid, banned_map[sid] == true)
+                    set_cache(sid, banned_map[sid] == true, reason_map[sid])
                     hook.Run("ETR_PlayerChecked", sid, banned_map[sid] == true)
                 end
             end
@@ -673,14 +832,23 @@ local function queue_retry(entry)
     log("Queued " .. (entry.type or "request") .. " for retry (" .. #state.retry_queue .. " pending)")
 end
 
-local function do_vote(api_id, reason_str, comment_str, retry_entry)
+local function do_vote(api_id, reason_slug, comment_str, retry_entry)
     if get_key() == "" then return end
     if rate_limited() and not retry_entry then return end
+    local slug = (type(reason_slug) == "string" and reason_slug ~= "") and reason_slug or DEFAULT_VOTE_REASON
+    local function requeue()
+        local entry = retry_entry or { type = "vote", steamid = api_id, reason = slug, comment = comment_str, attempts = 0 }
+        entry.attempts = entry.attempts + 1
+        if entry.attempts <= RETRY_MAX then
+            entry.next_at = CurTime() + 60 * math.pow(2, entry.attempts - 1)
+            queue_retry(entry)
+        end
+    end
     api_request({
         method = "POST",
         path = "/vote/" .. api_id,
         body = {
-            reason = type(reason_str) == "string" and reason_str:sub(1, 255) or "Server ban",
+            reason = slug,
             comment = type(comment_str) == "string" and comment_str:sub(1, 500) or "",
         },
         on_success = function(code, body)
@@ -699,36 +867,35 @@ local function do_vote(api_id, reason_str, comment_str, retry_entry)
                 end
             else
                 log_api_error(code, body, "Vote")
-                local entry = retry_entry or { type = "vote", steamid = api_id, reason = reason_str, comment = comment_str, attempts = 0 }
-                entry.attempts = entry.attempts + 1
-                if entry.attempts <= RETRY_MAX then
-                    entry.next_at = CurTime() + 60 * math.pow(2, entry.attempts - 1)
-                    queue_retry(entry)
-                end
+                if classify_failure(code, body) then requeue() end
             end
         end,
         on_fail = function(err)
             log("Vote failed: " .. tostring(err))
-            local entry = retry_entry or { type = "vote", steamid = api_id, reason = reason_str, comment = comment_str, attempts = 0 }
-            entry.attempts = entry.attempts + 1
-            if entry.attempts <= RETRY_MAX then
-                entry.next_at = CurTime() + 60 * math.pow(2, entry.attempts - 1)
-                queue_retry(entry)
-            end
+            requeue()
         end,
     })
 end
 
-local function do_add_bulk(steam_ids, reason, retry_entry)
+local function do_add_bulk(steam_ids, reason_slug, retry_entry)
     if type(steam_ids) ~= "table" or #steam_ids == 0 then return end
     if get_key() == "" then return end
     if rate_limited() and not retry_entry then return end
+    local slug = (type(reason_slug) == "string" and reason_slug ~= "") and reason_slug or DEFAULT_VOTE_REASON
+    local function requeue()
+        local entry = retry_entry or { type = "add_bulk", steam_ids = steam_ids, reason = slug, attempts = 0 }
+        entry.attempts = entry.attempts + 1
+        if entry.attempts <= RETRY_MAX then
+            entry.next_at = CurTime() + 60 * math.pow(2, entry.attempts - 1)
+            queue_retry(entry)
+        end
+    end
     api_request({
         method = "POST",
         path = "/add-bulk",
         body = {
             steam_ids = steam_ids,
-            reason = type(reason) == "string" and reason:sub(1, 255) or "Server ban list",
+            reason = slug,
         },
         on_success = function(code, body)
             if code >= 200 and code < 300 then
@@ -744,22 +911,12 @@ local function do_add_bulk(steam_ids, reason, retry_entry)
                 end
             else
                 log_api_error(code, body, "AddBulk")
-                local entry = retry_entry or { type = "add_bulk", steam_ids = steam_ids, reason = reason, attempts = 0 }
-                entry.attempts = entry.attempts + 1
-                if entry.attempts <= RETRY_MAX then
-                    entry.next_at = CurTime() + 60 * math.pow(2, entry.attempts - 1)
-                    queue_retry(entry)
-                end
+                if classify_failure(code, body) then requeue() end
             end
         end,
         on_fail = function(err)
             log("Add-bulk failed: " .. tostring(err))
-            local entry = retry_entry or { type = "add_bulk", steam_ids = steam_ids, reason = reason, attempts = 0 }
-            entry.attempts = entry.attempts + 1
-            if entry.attempts <= RETRY_MAX then
-                entry.next_at = CurTime() + 60 * math.pow(2, entry.attempts - 1)
-                queue_retry(entry)
-            end
+            requeue()
         end,
     })
 end
@@ -769,6 +926,7 @@ local function process_retry_queue()
     if not state.api_available then return end
     if rate_limited() then return end
     local now = CurTime()
+    local dispatched = 0
     for i = #state.retry_queue, 1, -1 do
         local entry = state.retry_queue[i]
         if entry.attempts > RETRY_MAX then
@@ -780,20 +938,22 @@ local function process_retry_queue()
             elseif entry.type == "add_bulk" then
                 do_add_bulk(entry.steam_ids, entry.reason, entry)
             end
-            return
+            dispatched = dispatched + 1
+            if dispatched >= 5 then return end
         end
     end
 end
 
-function ETR_SubmitBan(steamid, reason, duration_minutes)
+function ETR_SubmitBan(steamid, reason, duration_minutes, reason_slug)
     local api_id = to_steamid64(steamid) or steamid_for_api(steamid)
     if not api_id then return end
-    local reason_str = type(reason) == "string" and reason:sub(1, 255) or "Server ban"
-    local comment_str = reason_str
+    local free_text = (type(reason) == "string" and reason ~= "") and reason or "Server ban"
+    local comment_str = free_text
     if duration_minutes then
         comment_str = comment_str .. " (duration: " .. tostring(duration_minutes) .. "min)"
     end
-    do_vote(api_id, reason_str, comment_str, nil)
+    local slug = (type(reason_slug) == "string" and reason_slug ~= "") and reason_slug:lower() or resolve_reason_slug()
+    do_vote(api_id, slug, comment_str:sub(1, 500), nil)
 end
 
 local function on_server_ban(steamid, reason, duration_minutes)
@@ -844,11 +1004,12 @@ local function same_player(steamid, ply)
 end
 
 local function kick_banned_player(steamID64, source)
-    local reject_msg = get_reject_msg()
+    local reason = get_cached_reason(steamID64)
+    local reject_msg = get_reject_msg(reason)
     for _, p in ipairs(player.GetAll()) do
         if IsValid(p) and same_player(steamID64, p) then
             stats.blocks = stats.blocks + 1
-            hook.Run("ETR_PlayerBlocked", steamID64, p:Nick(), source or "check")
+            hook.Run("ETR_PlayerBlocked", steamID64, p:Nick(), source or "check", reason)
             p:Kick(reject_msg)
             break
         end
@@ -862,10 +1023,11 @@ hook.Add("CheckPassword", "ETR", function(steamID64, ipAddress, svPassword, clPa
     if not steamid then return end
     local cached = get_cached(steamID64)
     if cached == true then
+        local reason = get_cached_reason(steamID64)
         stats.blocks = stats.blocks + 1
-        hook.Run("ETR_PlayerBlocked", steamID64, name, "cache")
+        hook.Run("ETR_PlayerBlocked", steamID64, name, "cache", reason)
         log("Blocked: " .. steamid)
-        return false, get_reject_msg()
+        return false, get_reject_msg(reason)
     end
     if cached == false then return end
     local fail_open = (cv.fail_open and cv.fail_open:GetInt() ~= 0)
@@ -932,16 +1094,18 @@ concommand.Add("etr_pushbans", function(ply, cmd, args)
         log_always("No ban source found. Use etr_pushbans <steamid> or hook ETR_GetBansToPush.")
         return
     end
+    local slug = resolve_reason_slug()
+    local comment = (source and (source .. " ban list")) or "etr_pushbans"
     local can_add = state.key_info and state.key_info.can_add_users
     if can_add then
         for i = 1, #ids, ADD_BULK_MAX do
             local chunk = {}
             for j = i, math.min(i + ADD_BULK_MAX - 1, #ids) do chunk[#chunk + 1] = ids[j] end
-            do_add_bulk(chunk, source and (source .. " ban list") or "Server ban list", nil)
+            do_add_bulk(chunk, slug, nil)
         end
     else
         for _, id in ipairs(ids) do
-            do_vote(id, source and (source .. " ban") or "Server ban", "etr_pushbans", nil)
+            do_vote(id, slug, comment, nil)
         end
     end
     log_always("Pushed " .. #ids .. " IDs via " .. (can_add and "add-bulk" or "vote") .. " (" .. (source or "list") .. ")")
@@ -956,7 +1120,11 @@ end, nil, "Check ETR API key permissions", 0)
 
 concommand.Add("etr_stats", function(ply)
     if IsValid(ply) and not ply:IsSuperAdmin() then return end
-    print("[ETR] Session statistics:")
+    local ki = state.key_info or {}
+    print("[ETR] Session statistics (v" .. ETR_VERSION .. "):")
+    print("  Registered:    " .. tostring(state.registered) .. (state.server_id and (" (id=" .. state.server_id .. ")") or ""))
+    print("  Key:           " .. (ki.verified and "verified" or "unverified") .. (ki.can_add_users and ", can_add" or "") .. (get_secret() ~= "" and ", hmac" or ""))
+    print("  Vote reason:   " .. resolve_reason_slug() .. (state.valid_reasons and (" (" .. table.Count(state.valid_reasons) .. " slugs loaded)") or " (slugs not loaded)"))
     print("  Checks:        " .. stats.checks)
     print("  Blocks:        " .. stats.blocks)
     print("  Votes sent:    " .. stats.votes)
@@ -968,6 +1136,7 @@ concommand.Add("etr_stats", function(ply)
     print("  Batch queue:   " .. #state.batch_queue)
     print("  Cache size:    " .. table.Count(state.cache))
     print("  API available: " .. tostring(state.api_available))
+    print("  Clock synced:  " .. tostring(state.time_synced) .. " (offset " .. math.floor(state.server_time_offset) .. "s)")
     print("  Rate daily:    " .. tostring(rate.daily_remaining or "n/a") .. "/" .. tostring(rate.daily_limit or "n/a"))
     print("  Rate minute:   " .. tostring(rate.minute_remaining or "n/a") .. "/" .. tostring(rate.minute_limit or "n/a"))
     print("  Heartbeat in:  " .. (state.hb_next > 0 and math.floor(math.max(0, state.hb_next - CurTime())) .. "s" or "pending"))
@@ -1009,26 +1178,47 @@ concommand.Add("etr_add", function(ply, cmd, args)
         return
     end
     local sid = args[1] and steamid_for_api(args[1])
-    if not sid then print("[ETR] Usage: etr_add <steamid> [reason]") return end
-    local reason = args[2] or "Admin add"
+    if not sid then print("[ETR] Usage: etr_add <steamid> [reason_slug]") return end
+    local slug = (args[2] and args[2] ~= "") and string.Trim(args[2]):lower() or resolve_reason_slug()
+    if state.valid_reasons and not state.valid_reasons[slug] then
+        print("[ETR] Unknown reason slug '" .. slug .. "'. See etr_reasons. Using '" .. DEFAULT_VOTE_REASON .. "'.")
+        slug = DEFAULT_VOTE_REASON
+    end
     api_request({
         method = "POST",
         path = "/add/" .. sid,
-        body = { reason = reason:sub(1, 255) },
+        body = { reason = slug },
         on_success = function(code, body)
             if code >= 200 and code < 300 then
-                log_always("Added " .. sid .. " to ETR")
+                log_always("Added " .. sid .. " to ETR (" .. slug .. ")")
             else
                 log_api_error(code, body, "Add")
             end
         end,
         on_fail = function(err) print("[ETR] Failed: " .. tostring(err)) end,
     })
-end, nil, "Directly add Steam ID to ETR (admin key required)", 0)
+end, nil, "Directly add Steam ID to ETR (admin key required): etr_add <steamid> [reason_slug]", 0)
+
+concommand.Add("etr_reasons", function(ply)
+    if IsValid(ply) and not ply:IsSuperAdmin() then return end
+    if not state.valid_reasons then
+        print("[ETR] Reason list not loaded yet. Fetching...")
+        fetch_reasons()
+        return
+    end
+    local slugs = {}
+    for slug in pairs(state.valid_reasons) do slugs[#slugs + 1] = slug end
+    table.sort(slugs)
+    print("[ETR] Valid reason slugs (current: " .. resolve_reason_slug() .. "):")
+    for _, slug in ipairs(slugs) do
+        print("  " .. slug .. " - " .. tostring(state.valid_reasons[slug]))
+    end
+end, nil, "List valid ETR reason slugs for etr_vote_reason", 0)
 
 timer.Create("ETR_Refresh", 60, 0, function()
     refresh_cv()
     if get_key() ~= "" and not state.registered then register_server() end
+    if get_secret() ~= "" then sync_time() end
     clean_expired_cache()
     process_retry_queue()
 end)
@@ -1063,9 +1253,10 @@ timer.Create("ETR_PeriodicCheck", 30, 0, function()
             if IsValid(ply) then
                 local sid64 = steamid64_string(ply:SteamID64())
                 if sid64 and banned_map[sid64] then
+                    local reason = get_cached_reason(sid64)
                     stats.blocks = stats.blocks + 1
-                    hook.Run("ETR_PlayerBlocked", sid64, ply:Nick(), "periodic")
-                    ply:Kick(get_reject_msg())
+                    hook.Run("ETR_PlayerBlocked", sid64, ply:Nick(), "periodic", reason)
+                    ply:Kick(get_reject_msg(reason))
                     log("Periodic kick: " .. sid64)
                 end
             end
@@ -1088,6 +1279,8 @@ cvars.AddChangeCallback("etr_apikey", function(cvname, old, new)
     state.key_info = nil
     state.hb_next = 0
     if new and new ~= "" then
+        if not state.time_synced then state.time_sync_next = 0 end  -- reuse a fresh startup sync if we have one
+        sync_time()
         timer.Simple(1, function()
             register_server()
             check_key_info()
@@ -1098,9 +1291,12 @@ end, "ETR")
 
 timer.Simple(2, function()
     refresh_cv()
+    sync_time()     
+    fetch_reasons()   
     init_credentials()
-    timer.Simple(1, function()
+    timer.Simple(2, function()
         refresh_cv()
+        if state.registered then return end
         if get_key() ~= "" then
             register_server()
             check_key_info()
